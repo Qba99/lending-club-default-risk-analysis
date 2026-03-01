@@ -1,0 +1,511 @@
+---
+title: "Lending Club Case Study (R)"
+author: "Jakub Siuda"
+date: "2026-03-01"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Description
+
+**Lending Club** is a peer-to-peer Lending company based in the US. They match people looking to invest money with people looking to borrow money. When investors invest their money through Lending Club, this money is passed onto borrowers, and when borrowers pay their loans back, the capital plus the interest passes on back to the investors.
+
+This project analyzes Lending Club loan data to confirm the efficacy of the current customer grading system and identify key drivers of loan default and profitability. The goal is to simulate how a financial institution or investor could use data to improve credit decisions.
+
+## Objectives
+
+* Is the Lending Club grading system an effective predictor of loan performance?
+* Which customer segments have the highest default rates?
+* What policy recommendations could reduce risk?
+
+**Identify variables that significantly correlate with default to optimize the approval process and minimize the risk of default.**
+
+## Preperations
+
+Dataset used: [Lending Club Loan Data](https://www.kaggle.com/datasets/adarshsng/lending-club-loan-data-csv) (DbCL) v1.0 published by [adarshsng](https://www.kaggle.com/adarshsng) on [kaggle.com](https://www.kaggle.com/)
+
+The Lending Club dataset contains complete loan data for all loans issued through the 2007-2015, including the current loan status (Current, Late, Fully Paid, etc.) and latest payment information. Features (aka variables) include credit scores, number of finance inquiries, addresses including zip codes and state, and collections among others. Collections indicate whether the customer has missed one or more payments and the team is trying to recover their money. The file is a matrix of over 2 million observations and 145 variables.
+
+## Processing
+
+```{r lcdata, echo=FALSE}
+library(tidyverse)
+LCData <- read_csv("Data/Raw/loan.csv")
+```
+
+This analysis prioritizes business-logic-driven segmentation over automated modeling to identify clear, interpretable policy levers. For the sake of making this case study clear and concise I will focus only on the variables that I have deemed most useful for analysis. Those variables are: loan amount, installment, employment length, annual income, purpose and DTI. I will also evaluate the grade and sub grade variables that were assigned by Lending Club to each borrower, to confirm that they are accurate as well as the interest rate that is decided based on these factors.
+
+Furthermore, I will create one more variable that will clearly represent if the debt has been paid in full or written off as a loss.
+
+```{r clean}
+LCData_clean <- LCData %>%
+  filter(loan_status %in% c("Fully Paid", "Charged Off", "Default")) %>%
+  mutate(is_default = if_else(loan_status == "Fully Paid", 0, 1))
+
+LCData_final <- LCData_clean %>%
+  select(is_default, loan_amnt, int_rate, installment, 
+         grade, sub_grade, emp_length, annual_inc, 
+         purpose, dti)
+```
+
+Following these data transformation steps LCData_final contains 1303638 observations. Now, I’ll run a few checks to see if there are any missing values.
+
+```{r dti_check_1}
+LCData_final %>%
+  filter(is.na(dti)) %>%
+  nrow()
+```
+
+```{r dti_check_2}
+LCData_final %>%
+  filter(dti > 50 | dti < 0) %>%
+  nrow()
+```
+
+It seems that there are 312 rows that are missing their DTI value and 2491 rows that have a value of either below 0 or over 50. Negative DTI is not a legitimate value. Furthermore, industry standards place affordability limits around 43–50%. I treated values above 50% as extreme risk and investigated them as potential data errors. Since this is such a small portion of the whole, those rows were removed so that they do not skew the statistical results.
+
+```{r dti_clean, echo=FALSE}
+LCData_final <- LCData_final %>%
+  mutate(
+    dti = ifelse(dti < 0 | dti > 50, NA, dti),
+    emp_length = na_if(emp_length, "n/a")
+  ) %>%
+  filter(
+    !is.na(dti),
+    !is.na(emp_length)
+  )
+```
+
+To finalize my preparations before exploratory data analysis, I’ve decided to create “buckets” for numeric variables.
+
+```{r buckets}
+LCData_final <- LCData_final %>%
+  mutate(
+    income_group = cut(
+      annual_inc,
+      breaks = c(0, 40000, 70000, 100000, Inf),
+      labels = c("<40k", "40k-70k", "70k-100k", ">100k")
+    ),
+    
+    dti_bucket = cut(
+      dti,
+      breaks = c(0, 10, 20, 30, 40, Inf),
+      labels = c("0-10", "11-20", "21-30", "31-40", "41+"),
+      include.lowest = TRUE
+    ),
+    
+    loan_amnt_bucket = cut(
+      loan_amnt,
+      breaks = c(0, 10000, 20000, 30000, Inf),
+      labels = c("<10k", "10k-20k", "20k-30k", "30k-40k")
+    ),
+    
+    int_rate_bucket = cut(
+      int_rate,
+      breaks = c(5, 10, 15, 20, 25, Inf),
+      labels = c("5-10", "11-15", "15-20", "21-25", "26-31")
+    ),
+    
+    installment_bucket = cut(
+      installment,
+      breaks = c(0, 250, 500, 750, 1000, Inf),
+      labels = c("<=250", "250-500", "500-750", "750-1000", "1000+")
+    )
+  )
+```
+
+## Exploratory Data Analysis
+
+To start off the analysis and make sure everything is working fine so far, let's check the overall default rate of all the loans.
+
+```{r mean}
+mean(LCData_final$is_default)
+```
+
+Now, I'll divide the current data frame into 2 "summary tables". This step will help with the creation of plots later on. The first table will be called 'model_validation', its purpose is to show whether the current grading system and the resulting loan interest rate models are working as intended. The second table will be called 'summary_table' and it will help determine which factors are strongest predictors of potential defaults.
+
+```{r tables, echo=FALSE}
+model_validation <- LCData_final %>%
+  pivot_longer(
+    cols = c(
+      int_rate_bucket,
+      grade,
+      sub_grade
+    ),
+    names_to = "variable",
+    values_to = "category"
+  ) %>%
+  mutate(
+    variable = recode(
+      variable,
+      int_rate_bucket = "Interest rate",
+      grade = "Grade",
+      sub_grade = "Sub grade"
+    ),
+    variable = factor(
+      variable,
+      levels = c("Interest rate", "Grade", "Sub grade")
+    )
+  ) %>%
+  group_by(variable, category) %>%
+  summarize(
+    total_loans = n(),
+    default_rate = mean(is_default, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+summary_table <- LCData_final %>%
+  pivot_longer(
+    cols = c(
+      loan_amnt_bucket,
+      installment_bucket,
+      income_group,
+      dti_bucket,
+      purpose,
+      emp_length,
+    ),
+    names_to = "variable",
+    values_to = "category"
+  ) %>%
+  group_by(variable, category) %>%
+  summarize(
+    total_loans = n(),
+    default_rate = mean(is_default, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+```
+
+Now, onto the plots. First, let's examine default rates by interest rate and grade.
+
+```{r model_validation, echo=FALSE, fig.width=20, fig.height=8, out.width="100%"}
+ggplot(
+  model_validation,
+  aes(
+    x = fct_reorder(category, default_rate),
+    y = default_rate,
+    fill = default_rate
+  )
+) +
+  geom_col() +
+  facet_wrap(~ variable, scales = "free_x") +
+  scale_fill_gradient(
+    low = "lightgreen",
+    high = "lightcoral"
+  ) +
+  labs(
+    x = NULL,
+    y = "Default Rate (%)",
+    title = "System Validation: Realized Default Rates Align with Pricing Tiers",
+    fill = "Default Rate"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+Let's move onto plots of default rate by individual variable.
+
+```{r emp_length, echo=FALSE, fig.width=15, fig.height=6, out.width="100%"}
+summary_table %>%
+  filter(variable == "emp_length") %>%
+  ggplot(
+    aes(
+      x = fct_reorder(category, default_rate),
+      y = default_rate,
+      fill = default_rate
+    )
+  ) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(limits = c(0, 30)) +
+  labs(
+    x = "Employment Length",
+    y = "Default Rate (%)",
+    title = "Default Rate by Employment Length"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+```{r financial, echo=FALSE, fig.width=12, fig.height=5, out.width="100%"}
+summary_table %>%
+  filter(variable == "income_group") %>%
+  ggplot(
+    aes(
+      x = fct_reorder(category, default_rate),
+      y = default_rate,
+      fill = default_rate
+    )
+  ) +
+  geom_col(fill = "steelblue") +
+  labs(
+    x = "Income Group",
+    y = "Default Rate (%)",
+    title = "Default Rate by Annual Income"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+summary_table %>%
+  filter(variable == "loan_amnt_bucket") %>%
+  ggplot(
+    aes(
+      x = fct_reorder(category, default_rate),
+      y = default_rate,
+      fill = default_rate
+    )
+  ) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(limits = c(0, 30)) +
+  labs(
+    x = "Loan Amount",
+    y = "Default Rate (%)",
+    title = "Default Rate by Loan Amount"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+summary_table %>%
+  filter(variable == "installment_bucket") %>%
+  ggplot(
+    aes(
+      x = fct_reorder(category, default_rate),
+      y = default_rate,
+      fill = default_rate
+    )
+  ) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(limits = c(0, 30)) +
+  labs(
+    x = "Installment",
+    y = "Default Rate (%)",
+    title = "Default Rate by Installment"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+While 'Installment' is mathematically dependent on the interest rate, it serves as a crucial proxy for Monthly Liquidity Risk. The data reveals a 'break-point' at the $250 mark; loans with monthly commitments above this threshold exhibit a 48% higher relative default rate than smaller loans, suggesting a limit to the average borrower's monthly cash-flow flexibility.
+
+```{r purpose, echo=FALSE, fig.width=15, fig.height=6, out.width="100%"}
+library(stringr)
+
+summary_table %>%
+  filter(variable == "purpose") %>%
+  ggplot(
+    aes(
+      x = fct_reorder(
+        str_replace_all(str_to_title(category), "_", " "),
+        default_rate
+      ),
+      y = default_rate,
+      fill = default_rate
+    )
+  ) +
+  geom_col() +
+  scale_fill_gradient(low = "lightgreen", high = "lightcoral") +
+  labs(
+    x = "Loan Purpose",
+    y = "Default Rate (%)",
+    title = "Default Rate by Purpose"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+```
+
+```{r dti_plot, echo=FALSE, fig.width=12, fig.height=5, out.width="100%"}
+summary_table %>%
+  filter(variable == "dti_bucket") %>%
+  ggplot(
+    aes(
+      x = fct_reorder(
+        category,
+        default_rate
+      ),
+      y = default_rate,
+      fill = default_rate
+    )
+  ) +
+  geom_col() +
+  scale_fill_gradient(low = "lightgreen", high = "lightcoral") +
+  labs(
+    x = "DTI",
+    y = "Default Rate (%)",
+    title = "Default Rate by Debt-To-Income Ratio"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+To finish off this segment, I'll create 3 more plots. First, the correlation matrix heatmap.
+
+```{r correlation, echo=FALSE, fig.width=12, fig.height=12, out.width="100%"}
+library(ggcorrplot)
+
+options(repr.plot.width = 12, repr.plot.height = 12)
+
+corr_matrix <- LCData_final %>% 
+  select(is_default, loan_amnt, int_rate, annual_inc, dti, installment) %>% 
+  rename(
+    Default       = is_default,
+    "Loan Amount"   = loan_amnt,
+    "Interest Rate" = int_rate,
+    "Annual Income" = annual_inc,
+    DTI           = dti,
+    Installment   = installment
+  ) %>%
+  cor(use = "complete.obs")
+
+ggcorrplot(corr_matrix, lab = TRUE, title = "Correlation of Risk Factors")
+```
+
+Second, distribution boxplot of risk by variable.
+
+```{r risk_boxplot, echo=FALSE, fig.width=15, fig.height=6, out.width="100%"}
+ggplot(summary_table,
+       aes(
+         x = variable,
+         y = default_rate
+       )) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  scale_x_discrete(
+    labels = c(
+      dti_bucket         = "DTI",
+      emp_length         = "Employment Length",
+      income_group       = "Annual Income",
+      installment_bucket = "Installment",
+      loan_amnt_bucket   = "Loan Amount",
+      purpose            = "Purpose"
+    )
+  ) +
+  labs(
+    title = "Distribution of Default Rates by Risk Driver",
+    x = "Variable",
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+Third, a plot of top 15 behavioral risk drivers.
+
+```{r risk_drivers, echo=FALSE, fig.width=12, fig.height=8, out.width="100%"}
+library(forcats)
+
+top_risk <- summary_table %>%
+  filter(total_loans >= 500) %>%
+  mutate(
+    variable = recode(
+      variable,
+      dti_bucket         = "DTI",
+      emp_length         = "Employment Length",
+      income_group       = "Annual Income",
+      installment_bucket = "Installment",
+      loan_amnt_bucket   = "Loan Amount",
+      purpose            = "Purpose"
+    )
+  ) %>%
+  slice_max(default_rate, n = 15)
+
+ggplot(top_risk,
+       aes(
+         x = fct_reorder(
+           paste(variable, str_replace_all(str_to_title(category), "_", " "), sep = ": "),
+           default_rate
+         ),
+         y = default_rate,
+         fill = default_rate
+       )) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "lightgreen",
+    high = "lightcoral"
+  ) +
+  labs(
+    title = "Top 15 Behavioral Risk Drivers",
+    x = NULL,
+    y = "Default Rate (%)",
+    fill = "Default Rate"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none")
+```
+
+## Key Findings
+
+* **The Efficacy of Internal Grading**
+
+The analysis confirms that the Lending Club grading system is a highly effective predictor of loan performance. There is a near-linear increase in default risk as we move from Grade A (5.8% default rate) to Grade G (49.6% default rate). This suggests the current credit model is structurally sound but may require "surgical" refinements in high-risk sub-grades.
+
+* **Debt-to-Income (DTI) is one of the best predictors of default**
+
+Borrowers with a DTI < 10% default at a rate of 14.5%.
+Borrowers with a DTI > 40% default at a rate of 33.1%.
+Risk is driven not by how much a borrower earns, but by how much of that earnings is already "spoken for" by other debts.
+
+* **The "Small Business" Risk Premium**
+
+Loan Purpose is a significant behavioral indicator. Specifically, loans categorized for "Small Business" exhibit a 32.8% default rate, significantly higher than "Major Purchase" or "Credit Card Consolidation." This suggests that business-related loans carry operational risks that traditional consumer credit metrics may not fully capture.
+
+**The "Employment Length" is the weakest predictor of default**
+
+Data shows that Employment Length has a negligible impact on default rates. The difference in risk between a 1-year employee and a 10-year veteran is less than 2%.
+
+## Recommendations
+
+**Recommendation 1: Implement a DTI "Hard Cap"**
+
+To protect the portfolio from systemic shocks, Lending Club could implement a hard DTI ceiling of 35%. The data indicates that beyond this threshold, the probability of default increases exponentially. Alternatively, applicants with DTI above 30% should undergo an enhanced review.
+
+**Recommendation 2: Adjust Underwriting for Small Business Loans**
+
+Because "Small Business" loans perform more like commercial credit than consumer credit, I recommend:
+
+* Requiring secondary collateral or a "Personal Guarantee" for this specific category.
+* Increasing the interest rate floor for this segment by 150-200 basis points to account for the higher volatility.
+
+**Recommendation 3: Streamline the Application Process**
+
+Since "Employment Length" and "Annual Income" (to a lesser extent) are weak predictors of performance, the firm can reduce friction in the application process by simplifying the verification requirements for these fields, shifting resources instead toward more rigorous DTI and debt-verification audits.
+
+**Recommendation 4: Use Risk Segmentation for Early Warning Systems**
+
+Monitor high-risk buckets in real time:
+
+* DTI >30%
+* Interest rate >20%
+* Grades E–G
+* Small business
+
+Deploy early interventions, for example: payment reminders, restructuring offers or risk reviews.
+Early intervention can reduce loss severity in high-risk cohorts.
